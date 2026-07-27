@@ -197,8 +197,13 @@ st.sidebar.caption(f"Backend: `{BACKEND_URL}`")
 SAMPLE_SEASONAL = pd.DataFrame(
     {
         "Year": [2022, 2023, 2023, 2024, 2024, 2025],
-        "Season": ["Autumn", "Spring", "Autumn", "Spring", "Autumn", "Spring"],
-        "Admissions": [664, 413, 742, 335, 604, 374],
+        "Season": [
+            "Autumn",
+            "Spring",
+            "Autumn",
+            "Spring",
+        ],
+        "Admissions": [664, 413, 742, 335],
     }
 )
 
