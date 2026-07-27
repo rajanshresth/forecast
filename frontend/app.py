@@ -1,13 +1,16 @@
 """
-Streamlit UI — Admissions Forecasting
+Streamlit UI — Generic Time-Series Forecasting
 ------------------------------------------------
-Talks to the FastAPI backend (backend/main.py) to fetch data from
-Google Sheets and run Poisson GLM / Holt-Winters / OLS forecasts.
+Talks to the FastAPI backend (backend/main.py) to load data (Google Sheet,
+uploaded file, or pasted CSV) and run Poisson GLM / Holt-Winters / OLS
+forecasts on ANY dataset — you choose which column is the value, which
+column defines order, and which (if any) column is the seasonal category.
 
 Run with:  streamlit run app.py
 (Make sure the backend is running first: uvicorn main:app --port 8000)
 """
 
+import io
 import os
 import re
 import requests
@@ -18,15 +21,15 @@ import streamlit as st
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
 
-st.set_page_config(page_title="Admissions Forecasting", layout="wide")
-st.title("🏫🎓 Admissions Forecasting")
+st.set_page_config(page_title="Forecasting Studio", layout="wide")
+st.title("🔮 Forecasting Studio")
 st.caption(
-    "Poisson GLM · Holt-Winters (damped, seasonal) · Classical OLS with seasonality"
+    "Poisson GLM · Holt-Winters (damped, seasonal) · Classical OLS with seasonality — on any dataset"
 )
 
 
 # =========================================================
-# Helpers
+# Data-loading helpers
 # =========================================================
 def parse_sheet_url(url_or_id: str, default_gid: str = "0"):
     """Accepts either a raw Sheet ID or a full Google Sheets URL and returns (sheet_id, gid)."""
@@ -66,6 +69,70 @@ def run_forecast(data_points, seasonal_period, horizon, method):
     return resp.json()
 
 
+# =========================================================
+# Generic column-agnostic data shaping
+# =========================================================
+def smart_sort_series(series: pd.Series):
+    """Try numeric, then datetime, else leave as-is (original row order).
+    Returns (sort_key_or_None, kind_str)."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().all():
+        return numeric, "numeric"
+    dt = pd.to_datetime(series, errors="coerce")
+    if dt.notna().all():
+        return dt, "datetime"
+    return None, "unsortable"
+
+
+def build_data_points(df: pd.DataFrame, value_col: str, order_col, season_col):
+    """Build the generic {t, season, value, label} records the API expects,
+    regardless of the source dataframe's actual column names/shape."""
+    work = df.copy()
+    sort_note = None
+
+    if order_col:
+        key, kind = smart_sort_series(work[order_col])
+        if key is not None:
+            work = (
+                work.assign(_sort_key=key)
+                .sort_values("_sort_key")
+                .drop(columns="_sort_key")
+            )
+        else:
+            sort_note = (
+                f"Column '{order_col}' isn't numeric or a recognizable date, so rows are "
+                f"kept in their original order instead of being sorted by it."
+            )
+
+    work = work.reset_index(drop=True)
+    work["_t"] = np.arange(1, len(work) + 1)
+
+    if season_col:
+        work["_season"] = work[season_col].astype(str)
+    else:
+        work["_season"] = "ALL"
+
+    if order_col:
+        work["_label"] = work[order_col].astype(str)
+        if season_col:
+            work["_label"] = work["_label"] + " (" + work["_season"] + ")"
+    else:
+        work["_label"] = "t=" + work["_t"].astype(str)
+        if season_col:
+            work["_label"] = work["_label"] + " (" + work["_season"] + ")"
+
+    data_points = [
+        {
+            "t": int(work["_t"].iloc[i]),
+            "season": str(work["_season"].iloc[i]),
+            "value": float(work[value_col].iloc[i]),
+            "label": str(work["_label"].iloc[i]),
+        }
+        for i in range(len(work))
+    ]
+    return data_points, sort_note
+
+
 def build_chart(
     hist_labels,
     hist_values,
@@ -76,6 +143,7 @@ def build_chart(
     ci_upper,
     title,
     color,
+    y_label,
 ):
     fig = go.Figure()
 
@@ -136,7 +204,7 @@ def build_chart(
     fig.update_layout(
         title=title,
         xaxis_title="Period",
-        yaxis_title="Admissions",
+        yaxis_title=y_label,
         template="plotly_white",
         height=450,
         legend=dict(orientation="h", y=-0.2),
@@ -157,28 +225,149 @@ METHOD_COLORS = {
 
 
 # =========================================================
-# Sidebar — data source configuration
+# Sidebar — Step 1: Data source
 # =========================================================
-st.sidebar.header("⚙️ Data Source")
+st.sidebar.header("① Data Source")
 
-dataset_choice = st.sidebar.radio(
-    "Choose dataset",
-    ["Seasonal (Year + Season)", "Daily"],
-    help="Seasonal: Sheet1 (Year, Season, Admissions). Daily: Sheet2 (Day, Total admissions).",
+source_type = st.sidebar.radio(
+    "Where's your data?",
+    ["Google Sheet", "Upload file", "Paste CSV"],
 )
 
-st.sidebar.markdown("**Google Sheet**")
-sheet_url_input = st.sidebar.text_input(
-    "Sheet URL or Sheet ID",
-    help="Paste the full Google Sheets URL (with gid) or just the Sheet ID. "
-    "The sheet/tab must be shared as 'Anyone with the link can view'.",
-)
-manual_gid = st.sidebar.text_input("gid (tab id, optional override)", value="")
+df = None
+load_error = None
 
-use_sample_data = st.sidebar.checkbox("Use built-in sample data instead", value=True)
+if source_type == "Google Sheet":
+    sheet_url_input = st.sidebar.text_input(
+        "Sheet URL or Sheet ID",
+        help="Paste the full Google Sheets URL (with gid) or just the Sheet ID. "
+        "The sheet/tab must be shared as 'Anyone with the link can view'.",
+    )
+    manual_gid = st.sidebar.text_input("gid (tab id, optional override)", value="")
+    if sheet_url_input.strip():
+        default_gid = manual_gid.strip() if manual_gid.strip() else "0"
+        sheet_id, gid = parse_sheet_url(sheet_url_input, default_gid)
+        try:
+            with st.spinner("Fetching data from Google Sheets..."):
+                df = fetch_sheet(sheet_id, gid)
+        except Exception as e:
+            load_error = str(e)
 
+elif source_type == "Upload file":
+    uploaded = st.sidebar.file_uploader(
+        "CSV or Excel file", type=["csv", "xlsx", "xls"]
+    )
+    if uploaded is not None:
+        try:
+            if uploaded.name.lower().endswith((".xlsx", ".xls")):
+                df = pd.read_excel(uploaded)
+            else:
+                df = pd.read_csv(uploaded)
+        except Exception as e:
+            load_error = str(e)
+
+else:  # Paste CSV
+    pasted = st.sidebar.text_area(
+        "Paste CSV text",
+        height=150,
+        placeholder="col1,col2,col3\nval1,val2,val3\n...",
+    )
+    if pasted.strip():
+        try:
+            df = pd.read_csv(io.StringIO(pasted))
+        except Exception as e:
+            load_error = str(e)
+
+if load_error:
+    st.sidebar.error(f"Couldn't load data:\n\n{load_error}")
+
+if df is None:
+    st.info(
+        "👈 Load your data in the sidebar to get started (Google Sheet, file upload, or pasted CSV)."
+    )
+    st.stop()
+
+df = df.dropna(how="all").reset_index(drop=True)
+
+st.subheader("📄 Data Preview")
+st.dataframe(df, use_container_width=True, height=220)
+
+if df.empty or len(df.columns) < 1:
+    st.error("The loaded data has no usable rows/columns.")
+    st.stop()
+
+
+# =========================================================
+# Sidebar — Step 2: Column mapping (fully dynamic)
+# =========================================================
 st.sidebar.markdown("---")
-st.sidebar.header("🔮 Forecast Settings")
+st.sidebar.header("② Map Your Columns")
+
+numeric_cols = [
+    c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().all()
+]
+all_cols = list(df.columns)
+
+if not numeric_cols:
+    st.error(
+        "No column in this data is fully numeric — at least one column must contain "
+        "the values you want to forecast."
+    )
+    st.stop()
+
+value_col = st.sidebar.selectbox(
+    "Value column (what to forecast)",
+    numeric_cols,
+    index=len(numeric_cols) - 1,
+    help="The numeric column containing the values you want to predict.",
+)
+
+order_options = ["(row order)"] + [c for c in all_cols if c != value_col]
+order_col_choice = st.sidebar.selectbox(
+    "Order / time column",
+    order_options,
+    help="Defines the sequence of your data (e.g. Year, Date, Day). "
+    "Choose '(row order)' if your rows are already in the right sequence.",
+)
+order_col = None if order_col_choice == "(row order)" else order_col_choice
+
+season_options = ["(none)"] + [c for c in all_cols if c not in (value_col, order_col)]
+season_col_choice = st.sidebar.selectbox(
+    "Seasonal / category column (optional)",
+    season_options,
+    help="A categorical column that repeats in a cycle (e.g. Season, day-of-week). "
+    "Choose '(none)' if there's no seasonality.",
+)
+season_col = None if season_col_choice == "(none)" else season_col_choice
+
+data_points, sort_note = build_data_points(df, value_col, order_col, season_col)
+if sort_note:
+    st.sidebar.caption(f"ℹ️ {sort_note}")
+
+if season_col:
+    n_categories = len(set(d["season"] for d in data_points))
+    default_period = max(2, n_categories)
+    max_period = max(2, len(data_points) // 2)
+    seasonal_period = st.sidebar.number_input(
+        "Seasonal period (# categories per cycle)",
+        min_value=1,
+        max_value=max(2, max_period),
+        value=min(default_period, max(2, max_period)),
+        step=1,
+        help=f"Detected {n_categories} distinct value(s) in '{season_col}'.",
+    )
+else:
+    seasonal_period = 1
+    st.sidebar.caption(
+        "No seasonal column selected — seasonal period fixed at 1 (trend-only)."
+    )
+
+
+# =========================================================
+# Sidebar — Step 3: Forecast settings
+# =========================================================
+st.sidebar.markdown("---")
+st.sidebar.header("③ Forecast Settings")
 horizon = st.sidebar.slider("Periods to forecast", min_value=1, max_value=12, value=4)
 selected_methods = st.sidebar.multiselect(
     "Model(s)",
@@ -189,152 +378,6 @@ selected_methods = st.sidebar.multiselect(
 
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Backend: `{BACKEND_URL}`")
-
-
-# =========================================================
-# Sample data (fallback / demo)
-# =========================================================
-SAMPLE_SEASONAL = pd.DataFrame(
-    {
-        "Year": [2022, 2023, 2023, 2024, 2024, 2025],
-        "Season": [
-            "Autumn",
-            "Spring",
-            "Autumn",
-            "Spring",
-        ],
-        "Admissions": [664, 413, 742, 335],
-    }
-)
-
-SAMPLE_DAILY = pd.DataFrame(
-    {
-        "Day": list(range(1, 25)),
-        "Total number of admission": [
-            7,
-            8,
-            4,
-            8,
-            3,
-            6,
-            7,
-            8,
-            9,
-            4,
-            4,
-            0,
-            5,
-            9,
-            6,
-            5,
-            14,
-            9,
-            1,
-            5,
-            15,
-            4,
-            8,
-            11,
-        ],
-    }
-)
-
-
-# =========================================================
-# Load data
-# =========================================================
-df = None
-load_error = None
-
-if not use_sample_data and sheet_url_input.strip():
-    default_gid = manual_gid.strip() if manual_gid.strip() else "0"
-    sheet_id, gid = parse_sheet_url(sheet_url_input, default_gid)
-    if manual_gid.strip():
-        gid = manual_gid.strip()
-    try:
-        with st.spinner("Fetching data from Google Sheets..."):
-            df = fetch_sheet(sheet_id, gid)
-    except Exception as e:
-        load_error = str(e)
-
-if df is None:
-    df = (
-        SAMPLE_SEASONAL
-        if dataset_choice == "Seasonal (Year + Season)"
-        else SAMPLE_DAILY
-    )
-    if load_error:
-        st.sidebar.error(
-            f"Sheet fetch failed, showing sample data instead:\n\n{load_error}"
-        )
-
-st.subheader("📄 Data Preview")
-st.dataframe(df, use_container_width=True, height=220)
-
-
-# =========================================================
-# Build (t, season, value, label) records for the API
-# =========================================================
-data_points = None
-seasonal_period = None
-
-if dataset_choice == "Seasonal (Year + Season)":
-    required_cols = {"Year", "Season", "Admissions"}
-    if not required_cols.issubset(df.columns):
-        st.error(f"Expected columns {required_cols}, got {list(df.columns)}.")
-        st.stop()
-
-    seasons_present = list(df["Season"].unique())
-    seasonal_period = st.sidebar.number_input(
-        "Seasonal period (# of seasons/cycle)",
-        min_value=2,
-        max_value=12,
-        value=min(len(seasons_present), 2),
-        step=1,
-    )
-
-    work = df.reset_index(drop=True).copy()
-    work["t"] = np.arange(1, len(work) + 1)
-    work["label"] = work["Year"].astype(str) + "-" + work["Season"].astype(str)
-    data_points = [
-        {
-            "t": int(r.t),
-            "season": str(r.Season),
-            "value": float(r.Admissions),
-            "label": r.label,
-        }
-        for r in work.itertuples()
-    ]
-
-else:  # Daily
-    day_col = "Day" if "Day" in df.columns else df.columns[0]
-    value_col = (
-        "Total number of admission"
-        if "Total number of admission" in df.columns
-        else df.columns[1]
-    )
-
-    seasonal_period = st.sidebar.number_input(
-        "Seasonal period (e.g. 7 = day-of-week cycle)",
-        min_value=2,
-        max_value=31,
-        value=7,
-        step=1,
-    )
-
-    work = df.reset_index(drop=True).copy()
-    work["t"] = np.arange(1, len(work) + 1)
-    work["season"] = [f"CYCLE_{(i) % int(seasonal_period)}" for i in range(len(work))]
-    work["label"] = "Day " + work[day_col].astype(str)
-    data_points = [
-        {
-            "t": int(row.t),
-            "season": str(row.season),
-            "value": float(row[value_col]),
-            "label": row["label"],
-        }
-        for _, row in work.iterrows()
-    ]
 
 
 # =========================================================
@@ -370,17 +413,17 @@ if st.sidebar.button("Run Forecast", type="primary"):
         st.error(f"{METHOD_LABELS[method]} failed: {err}")
 
     if results:
-        # Relabel future periods nicely if seasonal dataset
+        # Relabel future periods nicely, continuing the detected seasonal pattern
+        pattern = [d["season"] for d in data_points[:seasonal_period]]
+        n = len(data_points)
         for method, res in results.items():
             n_future = len(res["future_labels"])
-            future_season = None
-            # derive continuing season pattern for nicer labels
-            pattern = [d["season"] for d in data_points[:seasonal_period]]
-            n = len(data_points)
             nice_future_labels = []
             for i in range(n_future):
                 s = pattern[(n + i) % seasonal_period]
-                nice_future_labels.append(f"+{i + 1} ({s})")
+                nice_future_labels.append(
+                    f"+{i + 1} ({s})" if season_col else f"+{i + 1}"
+                )
             res["future_labels"] = nice_future_labels
 
         tabs = st.tabs([METHOD_LABELS[m] for m in results.keys()])
@@ -401,6 +444,7 @@ if st.sidebar.button("Run Forecast", type="primary"):
                         res.get("ci_upper"),
                         METHOD_LABELS[method],
                         METHOD_COLORS[method],
+                        value_col,
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -451,5 +495,5 @@ if st.sidebar.button("Run Forecast", type="primary"):
             st.dataframe(pivot, use_container_width=True)
 else:
     st.info(
-        "Configure your data source and model(s) in the sidebar, then click **Run Forecast**."
+        "Map your columns and model(s) in the sidebar, then click **Run Forecast**."
     )

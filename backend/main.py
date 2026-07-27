@@ -12,8 +12,10 @@ Run with:  uvicorn main:app --reload --port 8000
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
+import io
 import numpy as np
 import pandas as pd
+import requests
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -75,16 +77,11 @@ def _future_seasons(
     return [pattern[(n + i) % seasonal_period] for i in range(horizon)]
 
 
-def _clean(values, apply_ceil: bool = False) -> List[float]:
-    """Replace NaN/inf with None-safe floats for JSON serialization.
-    Optionally applies ceiling to round up to the nearest whole number."""
+def _clean(values) -> List[float]:
+    """Replace NaN/inf with None-safe floats for JSON serialization."""
     out = []
     for v in np.asarray(values, dtype=float):
-        if np.isnan(v) or np.isinf(v):
-            out.append(None)
-        else:
-            val = np.ceil(v) if apply_ceil else v
-            out.append(float(val))
+        out.append(None if (np.isnan(v) or np.isinf(v)) else float(v))
     return out
 
 
@@ -103,18 +100,80 @@ def fetch_google_sheet(req: SheetRequest):
     The sheet (or specific tab) MUST be shared as
     'Anyone with the link can view' for this to work.
     """
-    url = f"https://docs.google.com/spreadsheets/d/{req.sheet_id}/export?format=csv&gid={req.gid}"
+    gid_value = req.gid.strip()
+    if gid_value.isdigit():
+        url = f"https://docs.google.com/spreadsheets/d/{req.sheet_id}/export?format=csv&gid={gid_value}"
+    else:
+        # Not a numeric gid — treat it as a sheet/tab NAME instead (e.g. "Sheet1"),
+        # using Google's gviz endpoint which accepts names directly.
+        from urllib.parse import quote
+
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{req.sheet_id}"
+            f"/gviz/tq?tqx=out:csv&sheet={quote(gid_value)}"
+        )
+
     try:
-        df = pd.read_csv(url)
+        r = requests.get(url, timeout=20, allow_redirects=True)
     except Exception as e:
+        raise HTTPException(
+            status_code=502, detail=f"Network error reaching Google Sheets: {e}"
+        )
+
+    content_type = r.headers.get("Content-Type", "")
+
+    if r.status_code == 400:
+        if gid_value.isdigit():
+            reason = (
+                f"the numeric gid '{gid_value}' does not exist on this spreadsheet, "
+                f"or the sheet_id is wrong"
+            )
+        else:
+            reason = (
+                f"there's no tab named '{gid_value}' on this spreadsheet (sheet/tab "
+                f"names are case-sensitive), or the sheet_id is wrong"
+            )
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Could not read the Google Sheet. Make sure it is shared as "
-                f"'Anyone with the link can view' and that the sheet_id/gid are correct. "
-                f"Underlying error: {e}"
+                f"Google rejected the request (HTTP 400) for URL: {url} — "
+                f"this almost always means {reason}. Open that exact URL in an "
+                f"incognito browser tab to see Google's own error page for confirmation."
             ),
         )
+
+    if r.status_code in (401, 403) or "accounts.google.com" in r.url:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Google requires sign-in to view this sheet. Set sharing to "
+                "'Anyone with the link' → Viewer, then try again."
+            ),
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unexpected response from Google (HTTP {r.status_code}) for URL: {url}",
+        )
+
+    if "text/html" in content_type:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Got an HTML page instead of CSV data — this sheet is not publicly "
+                "viewable yet. Set sharing to 'Anyone with the link' → Viewer, then try again."
+            ),
+        )
+
+    try:
+        df = pd.read_csv(io.StringIO(r.text))
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Downloaded the sheet but couldn't parse it as CSV: {e}",
+        )
+
     df = df.dropna(how="all")
     return SheetResponse(columns=list(df.columns), rows=df.to_dict(orient="records"))
 
@@ -149,11 +208,11 @@ def forecast(req: ForecastRequest):
 
         return ForecastResponse(
             labels=labels,
-            fitted=_clean(fit.fittedvalues.values, apply_ceil=True),
+            fitted=_clean(fit.fittedvalues.values),
             future_labels=future_labels,
-            forecast=_clean(pred["mean"].values, apply_ceil=True),
-            ci_lower=_clean(pred["obs_ci_lower"].values, apply_ceil=True),
-            ci_upper=_clean(pred["obs_ci_upper"].values, apply_ceil=True),
+            forecast=_clean(pred["mean"].values),
+            ci_lower=_clean(pred["obs_ci_lower"].values),
+            ci_upper=_clean(pred["obs_ci_upper"].values),
             params={k: float(v) for k, v in fit.params.items()},
             diagnostics={
                 "r_squared": float(fit.rsquared),
@@ -177,11 +236,11 @@ def forecast(req: ForecastRequest):
 
         return ForecastResponse(
             labels=labels,
-            fitted=_clean(fit.fittedvalues.values, apply_ceil=True),
+            fitted=_clean(fit.fittedvalues.values),
             future_labels=future_labels,
-            forecast=_clean(pred["mean"].values, apply_ceil=True),
-            ci_lower=_clean(pred["mean_ci_lower"].values, apply_ceil=True),
-            ci_upper=_clean(pred["mean_ci_upper"].values, apply_ceil=True),
+            forecast=_clean(pred["mean"].values),
+            ci_lower=_clean(pred["mean_ci_lower"].values),
+            ci_upper=_clean(pred["mean_ci_upper"].values),
             params={k: float(v) for k, v in fit.params.items()},
             diagnostics={
                 "deviance": float(fit.deviance),
@@ -197,12 +256,13 @@ def forecast(req: ForecastRequest):
 
     elif req.method == "holt_winters":
         y = pd.Series(value)
+        use_seasonal = req.seasonal_period > 1
         model = ExponentialSmoothing(
             y,
             trend="add",
             damped_trend=True,
-            seasonal="add",
-            seasonal_periods=req.seasonal_period,
+            seasonal="add" if use_seasonal else None,
+            seasonal_periods=req.seasonal_period if use_seasonal else None,
             initialization_method="estimated",
         )
         fit = model.fit()
@@ -214,8 +274,7 @@ def forecast(req: ForecastRequest):
             lo = np.nanpercentile(sims, 2.5, axis=1)
             hi = np.nanpercentile(sims, 97.5, axis=1)
             if not np.any(np.isnan(lo)) and not np.any(np.isnan(hi)):
-                ci_lower = _clean(lo, apply_ceil=True)
-                ci_upper = _clean(hi, apply_ceil=True)
+                ci_lower, ci_upper = _clean(lo), _clean(hi)
         except Exception:
             pass  # CI simulation can fail on degenerate/very short series; forecast still returned
 
@@ -225,9 +284,9 @@ def forecast(req: ForecastRequest):
 
         return ForecastResponse(
             labels=labels,
-            fitted=_clean(fit.fittedvalues, apply_ceil=True),
+            fitted=_clean(fit.fittedvalues),
             future_labels=future_labels,
-            forecast=_clean(fc.values, apply_ceil=True),
+            forecast=_clean(fc.values),
             ci_lower=ci_lower,
             ci_upper=ci_upper,
             params=params,
